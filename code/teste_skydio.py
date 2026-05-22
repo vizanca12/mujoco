@@ -6,6 +6,8 @@ import mujoco.viewer
 import numpy as np
 import math
 
+import disturbs
+
 
 def calibrate_hover(model: mujoco.MjModel, init_data: mujoco.MjData, site_id: int,
                     ctrl_ids: np.ndarray, max_motor: float = 13.0,
@@ -189,6 +191,25 @@ def main() -> None:
     leader_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "leader-x2")
     follower_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "follower-x2")
 
+    # -----------------
+    # Disturbances setup
+    # -----------------
+    rng = np.random.default_rng(0)
+
+    enable_leader_pos_noise = True
+    leader_pos_noise_sigma_m = 0.01  # meters (std)
+    leader_pos_noise_clip_m = 0.03
+    use_noisy_leader_for_consensus = True
+
+    enable_wind_on_follower = True
+    wind = disturbs.wind_params(
+        steady_force_world=(0.6, 0.0, 0.0),
+        gust_force_dir_world=(1.0, 0.2, 0.0),
+        gust_amp=0.6,
+        gust_freq_hz=0.25,
+        turbulence_sigma=0.15,
+    )
+
     # Optional: disable collisions between drones, keep floor collisions.
     disable_inter_drone_collisions = True
     if disable_inter_drone_collisions:
@@ -229,14 +250,14 @@ def main() -> None:
         # Ensure derived quantities (site_xpos, site_xmat, sensors) are up-to-date.
         mujoco.mj_forward(model, data)
 
-        dt = model.opt.timestep
-        prev_pos = {
-            "leader": data.site_xpos[leader_imu_id].copy(),
-            "follower": data.site_xpos[follower_imu_id].copy(),
-        }
+        dt = float(model.opt.timestep)
+        leader_dofadr = int(model.body_dofadr[leader_body_id])
+        follower_dofadr = int(model.body_dofadr[follower_body_id])
+        leader_pos_true0 = data.site_xpos[leader_imu_id].copy()
+        follower_pos_true0 = data.site_xpos[follower_imu_id].copy()
 
         # Keep initial spacing as the desired formation offset (avoids initial jump)
-        formation_offset = prev_pos["follower"] - prev_pos["leader"]
+        formation_offset = follower_pos_true0 - leader_pos_true0
 
         # Sensor ids for angular velocity (gyro). MuJoCo returns body-frame omega.
         leader_gyro_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, "leader-body_gyro")
@@ -282,13 +303,35 @@ def main() -> None:
 
         t = 0.0
         while viewer.is_running():
-            # read positions
-            leader_pos = data.site_xpos[leader_imu_id].copy()
-            follower_pos = data.site_xpos[follower_imu_id].copy()
+            # Apply wind on follower (external force). Clear previous step first.
+            disturbs.clear_applied_wrench(xfrc_applied=data.xfrc_applied, body_id=follower_body_id)
+            if enable_wind_on_follower:
+                F_wind = disturbs.sample_wind_force_world(t=t, rng=rng, params=wind)
+                disturbs.apply_wind_wrench(
+                    xfrc_applied=data.xfrc_applied,
+                    body_id=follower_body_id,
+                    force_world=F_wind,
+                )
 
-            # velocities by finite difference
-            leader_vel = (leader_pos - prev_pos["leader"]) / dt
-            follower_vel = (follower_pos - prev_pos["follower"]) / dt
+            # read true positions
+            leader_pos_true = data.site_xpos[leader_imu_id].copy()
+            follower_pos_true = data.site_xpos[follower_imu_id].copy()
+
+            # measured positions (inject measurement noise)
+            if enable_leader_pos_noise:
+                leader_pos = disturbs.add_position_noise(
+                    pos_world=leader_pos_true,
+                    rng=rng,
+                    sigma=leader_pos_noise_sigma_m,
+                    clip=leader_pos_noise_clip_m,
+                )
+            else:
+                leader_pos = leader_pos_true
+            follower_pos = follower_pos_true
+
+            # Use MuJoCo-provided linear velocity from the freejoint (world frame).
+            leader_vel = data.qvel[leader_dofadr:leader_dofadr + 3].copy()
+            follower_vel = data.qvel[follower_dofadr:follower_dofadr + 3].copy()
 
             psi_des = 0.0
 
@@ -324,8 +367,11 @@ def main() -> None:
             )
 
             # Follower consensus: track leader state + fixed formation offset
-            follower_pos_des = leader_pos + formation_offset
-            follower_vel_des = leader_vel
+            leader_pos_for_consensus = leader_pos if use_noisy_leader_for_consensus else leader_pos_true
+            leader_vel_for_consensus = leader_vel
+
+            follower_pos_des = leader_pos_for_consensus + formation_offset
+            follower_vel_des = leader_vel_for_consensus
             follower_acc_des = a_cmd_leader
 
             R_follower = data.site_xmat[follower_imu_id].reshape(3, 3)
@@ -362,8 +408,6 @@ def main() -> None:
             viewer.sync()
             time.sleep(model.opt.timestep)
 
-            prev_pos["leader"] = leader_pos
-            prev_pos["follower"] = follower_pos
             t += dt
 
 
