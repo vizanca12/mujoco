@@ -7,6 +7,7 @@ import numpy as np
 import math
 
 import disturbs
+from sim_logger import SimDataRecorder
 
 
 def calibrate_hover(model: mujoco.MjModel, init_data: mujoco.MjData, site_id: int,
@@ -157,77 +158,142 @@ def quad_backstepping_control(
     return u, a_cmd
 
 
+def chain_adjacency(n: int) -> np.ndarray:
+    """Directed chain graph adjacency matrix.
+
+    Convention: A[i, j] > 0 means agent i receives info from agent j.
+
+    For a chain (Drone1 -> Drone2 -> ... -> DroneN):
+      A[i, i-1] = 1 for i >= 1.
+    """
+    if n < 2:
+
+        raise ValueError("n must be >= 2")
+    A = np.zeros((n, n), dtype=float)
+    for i in range(1, n):
+        A[i, i - 1] = 1.0
+    return A
+
+
+def star_adjacency(n: int) -> np.ndarray:
+    A = np.zeros((n, n), dtype=float)
+    for i in range(1, n):
+        A[i, 0] = 1.0  # Todos os seguidores olham APENAS para o Líder
+    return A
+
+
+def laplacian_from_adjacency(A: np.ndarray) -> np.ndarray:
+    """Graph Laplacian L = D - A (row-sum degree for directed graphs)."""
+    A = np.asarray(A, dtype=float)
+    if A.ndim != 2 or A.shape[0] != A.shape[1]:
+        raise ValueError("A must be square")
+    D = np.diag(A.sum(axis=1))
+    return D - A
+
+
 def main() -> None:
     base_dir = Path(__file__).resolve().parents[1]
     model_dir = base_dir / "model" / "skydio_x2"
 
     print("Montando o sistema multi-agente...")
 
+    # -----------------
+    # Multi-drone setup
+    # -----------------
+    # Use 4 ou 5 drones aqui.
+    n_drones = 5
+    if n_drones < 2:
+        raise ValueError("n_drones must be >= 2")
+
+    prefixes = [f"drone{i + 1}-" for i in range(n_drones)]  # Drone1-, Drone2-, ...
+
+    spawn_spacing_x = 1.5
+    spawn_z = 0.1
+
     # Cena base do ambiente.
     cena = mujoco.MjSpec.from_file(str(model_dir / "scene.xml"))
 
-    # Dois drones independentes com nomes unicos ao anexar.
-    lider = mujoco.MjSpec.from_file(str(model_dir / "x2.xml"))
-    seguidor = mujoco.MjSpec.from_file(str(model_dir / "x2.xml"))
-
-    ancora_lider = cena.worldbody.add_site(pos=[0, 0, 0.1])
-    cena.attach(lider, site=ancora_lider, prefix="leader-")
-
-    ancora_seguidor = cena.worldbody.add_site(pos=[1.5, 0, 0.1])
-    cena.attach(seguidor, site=ancora_seguidor, prefix="follower-")
+    # Instancia N drones independentes com nomes unicos via prefix.
+    for i, prefix in enumerate(prefixes):
+        drone_spec = mujoco.MjSpec.from_file(str(model_dir / "x2.xml"))
+        anchor = cena.worldbody.add_site(pos=[spawn_spacing_x * i, 0.0, spawn_z])
+        cena.attach(drone_spec, site=anchor, prefix=prefix)
 
     model = cena.compile()
 
-    # Map actuators by name (robust to ordering)
-    leader_act_ids = np.array([
-        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"leader-thrust{i}")
-        for i in range(1, 5)
-    ], dtype=int)
-    follower_act_ids = np.array([
-        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"follower-thrust{i}")
-        for i in range(1, 5)
-    ], dtype=int)
+    def checked_name2id(obj: mujoco.mjtObj, name: str) -> int:
+        idx = mujoco.mj_name2id(model, obj, name)
+        if idx < 0:
+            raise RuntimeError(f"Nome nao encontrado no modelo: '{name}'")
+        return int(idx)
 
-    leader_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "leader-x2")
-    follower_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "follower-x2")
+    # IDs por drone (atuadores, corpo raiz, sites/sensores)
+    act_ids: list[np.ndarray] = []
+    body_ids = np.zeros(n_drones, dtype=int)
+    imu_site_ids = np.zeros(n_drones, dtype=int)
+    gyro_sensor_ids = np.zeros(n_drones, dtype=int)
+
+    for i, prefix in enumerate(prefixes):
+        act = np.array([
+            checked_name2id(mujoco.mjtObj.mjOBJ_ACTUATOR, f"{prefix}thrust{k}")
+            for k in range(1, 5)
+        ], dtype=int)
+        act_ids.append(act)
+
+        body_ids[i] = checked_name2id(mujoco.mjtObj.mjOBJ_BODY, f"{prefix}x2")
+        imu_site_ids[i] = checked_name2id(mujoco.mjtObj.mjOBJ_SITE, f"{prefix}imu")
+        gyro_sensor_ids[i] = checked_name2id(mujoco.mjtObj.mjOBJ_SENSOR, f"{prefix}body_gyro")
 
     # -----------------
     # Disturbances setup
     # -----------------
     rng = np.random.default_rng(0)
 
+    leader_idx = 0  # Drone1 = lider
     enable_leader_pos_noise = True
     leader_pos_noise_sigma_m = 0.01  # meters (std)
     leader_pos_noise_clip_m = 0.03
     use_noisy_leader_for_consensus = True
 
-    enable_wind_on_follower = True
+    enable_wind = True
+    wind_target_indices = [1]  # ex: [1] -> aplica vento no Drone2
     wind = disturbs.wind_params(
         steady_force_world=(0.6, 0.0, 0.0),
         gust_force_dir_world=(1.0, 0.2, 0.0),
-        gust_amp=0.6,
+        gust_amp= 0.6,
         gust_freq_hz=0.25,
         turbulence_sigma=0.15,
     )
 
     # Optional: disable collisions between drones, keep floor collisions.
-    disable_inter_drone_collisions = True
+    disable_inter_drone_collisions = False
     if disable_inter_drone_collisions:
         floor_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
         if floor_gid >= 0:
-            model.geom_contype[floor_gid] = 4
-            model.geom_conaffinity[floor_gid] = 3
+            # Allocate a dedicated collision bit for the floor, and one bit per drone.
+            floor_contype = 1 << n_drones
+            drone_bits = [1 << i for i in range(n_drones)]
+            floor_conaffinity = (1 << n_drones) - 1
 
-        leader_geoms = np.where(model.geom_bodyid == leader_body_id)[0]
-        follower_geoms = np.where(model.geom_bodyid == follower_body_id)[0]
-        for gid in leader_geoms:
-            if model.geom_contype[gid] != 0:
-                model.geom_contype[gid] = 1
-                model.geom_conaffinity[gid] = 4
-        for gid in follower_geoms:
-            if model.geom_contype[gid] != 0:
-                model.geom_contype[gid] = 2
-                model.geom_conaffinity[gid] = 4
+            model.geom_contype[floor_gid] = floor_contype
+            model.geom_conaffinity[floor_gid] = floor_conaffinity
+
+            prefix_to_bit = {prefix: bit for prefix, bit in zip(prefixes, drone_bits)}
+            for gid in range(model.ngeom):
+                if model.geom_contype[gid] == 0:
+                    continue
+                gname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid)
+                if not gname:
+                    continue
+                matched_bit = None
+                for prefix, bit in prefix_to_bit.items():
+                    if gname.startswith(prefix):
+                        matched_bit = bit
+                        break
+                if matched_bit is None:
+                    continue
+                model.geom_contype[gid] = matched_bit
+                model.geom_conaffinity[gid] = floor_contype
 
     data = mujoco.MjData(model)
 
@@ -235,37 +301,36 @@ def main() -> None:
     print("Iniciando a simulacao em 3 segundos...")
 
     gravity = model.opt.gravity.copy()
-    m_leader = float(model.body_mass[leader_body_id])
-    m_follower = float(model.body_mass[follower_body_id])
-    I_leader = model.body_inertia[leader_body_id].astype(float)
-    I_follower = model.body_inertia[follower_body_id].astype(float)
-    max_motor = float(model.actuator_ctrlrange[leader_act_ids[0], 1])
+
+    m = model.body_mass[body_ids].astype(float)
+    I_diag = model.body_inertia[body_ids].astype(float)
+    max_motor = float(model.actuator_ctrlrange[act_ids[0][0], 1])
+
+    dofadr = model.body_dofadr[body_ids].astype(int)
+
+    # -----------------
+    # Communication graph
+    # -----------------
+    # Drone3 segue Drone2 porque A[2,1] = 1 no grafo em cadeia.
+    #A = chain_adjacency(n_drones)
+    A = star_adjacency(n_drones)
+    L = laplacian_from_adjacency(A)
+    print("Adjacency A (i recebe de j):")
+    print(A)
+    print("Laplaciana L = D - A:")
+    print(L)
+
+    labels = [p[:-1] if p.endswith("-") else p for p in prefixes]
+    recorder = SimDataRecorder(n_drones=n_drones, labels=labels)
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
         time.sleep(3)
-        # Prepare site ids for state reading
-        leader_imu_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "leader-imu")
-        follower_imu_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "follower-imu")
-
         # Ensure derived quantities (site_xpos, site_xmat, sensors) are up-to-date.
         mujoco.mj_forward(model, data)
 
         dt = float(model.opt.timestep)
-        leader_dofadr = int(model.body_dofadr[leader_body_id])
-        follower_dofadr = int(model.body_dofadr[follower_body_id])
-        leader_pos_true0 = data.site_xpos[leader_imu_id].copy()
-        follower_pos_true0 = data.site_xpos[follower_imu_id].copy()
 
-        # Keep initial spacing as the desired formation offset (avoids initial jump)
-        formation_offset = follower_pos_true0 - leader_pos_true0
-
-        # Sensor ids for angular velocity (gyro). MuJoCo returns body-frame omega.
-        leader_gyro_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, "leader-body_gyro")
-        follower_gyro_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, "follower-body_gyro")
-        if leader_gyro_id < 0 or follower_gyro_id < 0:
-            raise RuntimeError(
-                "Gyro sensor nao encontrado. Verifique os nomes 'leader-body_gyro' e 'follower-body_gyro'."
-            )
+        pos0 = data.site_xpos[imu_site_ids].copy()
 
         def read_sensor_vec(sensor_id: int) -> np.ndarray:
             adr = int(model.sensor_adr[sensor_id])
@@ -302,113 +367,125 @@ def main() -> None:
             return (np.array([x, y, z]), np.array([vx, vy, vz]), np.array([ax, ay, az]))
 
         t = 0.0
+        a_cmd_prev = np.zeros((n_drones, 3), dtype=float)
         while viewer.is_running():
-            # Apply wind on follower (external force). Clear previous step first.
-            disturbs.clear_applied_wrench(xfrc_applied=data.xfrc_applied, body_id=follower_body_id)
-            if enable_wind_on_follower:
-                F_wind = disturbs.sample_wind_force_world(t=t, rng=rng, params=wind)
-                disturbs.apply_wind_wrench(
-                    xfrc_applied=data.xfrc_applied,
-                    body_id=follower_body_id,
-                    force_world=F_wind,
-                )
+            # Clear previous applied wrenches, then apply wind to selected drones.
+            for bid in body_ids:
+                disturbs.clear_applied_wrench(xfrc_applied=data.xfrc_applied, body_id=int(bid))
+            if enable_wind:
+                for wi in wind_target_indices:
+                    if wi < 0 or wi >= n_drones:
+                        continue
+                    F_wind = disturbs.sample_wind_force_world(t=t, rng=rng, params=wind)
+                    disturbs.apply_wind_wrench(
+                        xfrc_applied=data.xfrc_applied,
+                        body_id=int(body_ids[wi]),
+                        force_world=F_wind,
+                    )
 
-            # read true positions
-            leader_pos_true = data.site_xpos[leader_imu_id].copy()
-            follower_pos_true = data.site_xpos[follower_imu_id].copy()
+            # True state
+            pos_true = data.site_xpos[imu_site_ids].copy()
 
-            # measured positions (inject measurement noise)
+            # Measured/communicated positions (inject noise on leader, optionally used by the graph)
+            pos_meas = pos_true.copy()
             if enable_leader_pos_noise:
-                leader_pos = disturbs.add_position_noise(
-                    pos_world=leader_pos_true,
+                pos_meas[leader_idx] = disturbs.add_position_noise(
+                    pos_world=pos_true[leader_idx],
                     rng=rng,
                     sigma=leader_pos_noise_sigma_m,
                     clip=leader_pos_noise_clip_m,
                 )
-            else:
-                leader_pos = leader_pos_true
-            follower_pos = follower_pos_true
+
+            pos_comm = pos_true.copy()
+            if enable_leader_pos_noise and use_noisy_leader_for_consensus:
+                pos_comm[leader_idx] = pos_meas[leader_idx]
 
             # Use MuJoCo-provided linear velocity from the freejoint (world frame).
-            leader_vel = data.qvel[leader_dofadr:leader_dofadr + 3].copy()
-            follower_vel = data.qvel[follower_dofadr:follower_dofadr + 3].copy()
+            vel = np.zeros((n_drones, 3), dtype=float)
+            for i in range(n_drones):
+                adr = int(dofadr[i])
+                vel[i] = data.qvel[adr:adr + 3]
 
             psi_des = 0.0
 
+            u_cmd = [None] * n_drones
+            a_cmd = np.zeros((n_drones, 3), dtype=float)
+            pos_ref_all = np.zeros((n_drones, 3), dtype=float)
+
             # Leader reference trajectory
-            pos_des, vel_des, acc_des = leader_desired(t)
+            pos_des_0, vel_des_0, acc_des_0 = leader_desired(t)
 
-            # Leader state (attitude + omega)
-            R_leader = data.site_xmat[leader_imu_id].reshape(3, 3)
-            omega_leader = read_sensor_vec(leader_gyro_id)
+            for i in range(n_drones):
+                R_i = data.site_xmat[imu_site_ids[i]].reshape(3, 3)
+                omega_i = read_sensor_vec(int(gyro_sensor_ids[i]))
 
-            u_leader, a_cmd_leader = quad_backstepping_control(
-                pos=leader_pos,
-                vel=leader_vel,
-                R=R_leader,
-                omega_body=omega_leader,
-                pos_des=pos_des,
-                vel_des=vel_des,
-                acc_des=acc_des,
-                psi_des=psi_des,
-                m=m_leader,
-                gravity=gravity,
-                I_diag=I_leader,
-                kp_xy=kp_xy,
-                kd_xy=kd_xy,
-                kp_z=kp_z,
-                kd_z=kd_z,
-                k_R=k_R,
-                k_omega=k_omega,
-                arm_x=arm_x,
-                arm_y=arm_y,
-                yaw_coeff=yaw_coeff,
-                max_motor=max_motor,
-            )
+                if i == leader_idx:
+                    pos_des_i = pos_des_0
+                    vel_des_i = vel_des_0
+                    acc_des_i = acc_des_0
+                    pos_i = pos_meas[i]
+                else:
+                    nbrs = np.where(A[i] > 0.0)[0]
+                    if nbrs.size == 0:
+                        raise RuntimeError(f"Drone{i + 1} nao tem vizinhos de entrada no grafo (linha {i}).")
+                    w = A[i, nbrs].astype(float)
+                    w = w / float(w.sum())
 
-            # Follower consensus: track leader state + fixed formation offset
-            leader_pos_for_consensus = leader_pos if use_noisy_leader_for_consensus else leader_pos_true
-            leader_vel_for_consensus = leader_vel
+                    # Formation offset along each communication edge: pos0[i] - pos0[j].
+                    delta = pos0[i] - pos0[nbrs]
+                    pos_ref_neighbors = pos_comm[nbrs] + delta
 
-            follower_pos_des = leader_pos_for_consensus + formation_offset
-            follower_vel_des = leader_vel_for_consensus
-            follower_acc_des = a_cmd_leader
+                    pos_des_i = (w[:, None] * pos_ref_neighbors).sum(axis=0)
+                    vel_des_i = (w[:, None] * vel[nbrs]).sum(axis=0)
+                    # acc_des_i = (w[:, None] * a_cmd_prev[nbrs]).sum(axis=0)
+                    pos_i = pos_true[i]
 
-            R_follower = data.site_xmat[follower_imu_id].reshape(3, 3)
-            omega_follower = read_sensor_vec(follower_gyro_id)
+                pos_ref_all[i] = pos_des_i
 
-            u_follower, _a_cmd_follower = quad_backstepping_control(
-                pos=follower_pos,
-                vel=follower_vel,
-                R=R_follower,
-                omega_body=omega_follower,
-                pos_des=follower_pos_des,
-                vel_des=follower_vel_des,
-                acc_des=follower_acc_des,
-                psi_des=psi_des,
-                m=m_follower,
-                gravity=gravity,
-                I_diag=I_follower,
-                kp_xy=kp_xy,
-                kd_xy=kd_xy,
-                kp_z=kp_z,
-                kd_z=kd_z,
-                k_R=k_R,
-                k_omega=k_omega,
-                arm_x=arm_x,
-                arm_y=arm_y,
-                yaw_coeff=yaw_coeff,
-                max_motor=max_motor,
-            )
+                u_i, a_i = quad_backstepping_control(
+                    pos=pos_i,
+                    vel=vel[i],
+                    R=R_i,
+                    omega_body=omega_i,
+                    pos_des=pos_des_i,
+                    vel_des=vel_des_i,
+                    acc_des=acc_des_i,
+                    psi_des=psi_des,
+                    m=float(m[i]),
+                    gravity=gravity,
+                    I_diag=I_diag[i],
+                    kp_xy=kp_xy,
+                    kd_xy=kd_xy,
+                    kp_z=kp_z,
+                    kd_z=kd_z,
+                    k_R=k_R,
+                    k_omega=k_omega,
+                    arm_x=arm_x,
+                    arm_y=arm_y,
+                    yaw_coeff=yaw_coeff,
+                    max_motor=max_motor,
+                )
+                u_cmd[i] = u_i
+                a_cmd[i] = a_i
 
-            data.ctrl[leader_act_ids] = u_leader
-            data.ctrl[follower_act_ids] = u_follower
+                data.ctrl[act_ids[i]] = u_i
+
+            a_cmd_prev = a_cmd
+
+            # Log before stepping: compare real position vs reference used in this iteration.
+            recorder.log(t=t, pos_true=pos_true, pos_ref=pos_ref_all)
 
             mujoco.mj_step(model, data)
             viewer.sync()
             time.sleep(model.opt.timestep)
 
             t += dt
+
+    # When the MuJoCo window is closed, generate plots.
+    recorder.plot(title="Posicao: real (solido) vs referencia (tracejado)")
+    # Cascata: como o Drone2 (idx=1) afeta o Drone3 (idx=2) via grafo.
+    if n_drones >= 3:
+        recorder.plot_cascade(pos0=pos0, A=A, leader_idx=leader_idx, src_idx=1, dst_idx=2)
 
 
 if __name__ == "__main__":
